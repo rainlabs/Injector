@@ -6,6 +6,33 @@
 #include <TlHelp32.h>
 #include <Shlwapi.h>
 #include <stdexcept>
+#include <Dbghelp.h>
+
+
+bool Is64BitHandle(const HANDLE &hInputHandle)
+{
+	// map the file to our address space
+	// first, create a file mapping object
+	HANDLE hMap = CreateFileMapping(
+		hInputHandle,
+		NULL,
+		PAGE_READONLY,
+		0,
+		0,
+		NULL);
+
+	// next, map the file to our address space
+	LPVOID lpMapAddr = MapViewOfFileEx(
+		hMap,
+		FILE_MAP_READ,
+		0,
+		0,
+		0,
+		NULL);
+
+	PIMAGE_NT_HEADERS headers = ImageNtHeader(lpMapAddr);
+	return (headers->FileHeader.Machine != IMAGE_FILE_MACHINE_I386);
+}
 
 namespace Inject
 {
@@ -20,22 +47,43 @@ namespace Inject
 			throw std::runtime_error("couldn't open target process");
 		}
 
+		// Detect dll architecture
+		HANDLE hFile = CreateFileA(sDllPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, 
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		bool is64BitDll = Is64BitHandle(hFile);
+		CloseHandle(hFile);
+
+		// Detect process architecture
+		BOOL bIs32Bit = FALSE;
+		if (!IsWow64Process(m_hProcess, &bIs32Bit)) {
+			CloseHandle(m_hProcess);
+			throw std::runtime_error("not recognize process architecture");
+		}
+
+		// if not compatible archictures
+		if (is64BitDll != (bIs32Bit == FALSE)) {
+			CloseHandle(m_hProcess);
+			throw std::runtime_error("Not compatible architecture dll and target process");
+		}
+
 		LPVOID lpProcAddr = (LPVOID)GetProcAddress(GetModuleHandle(L"kernel32.dll"), "LoadLibraryA");
 		LPVOID lpProcParam = (LPVOID)sDllPath.c_str();
 		SIZE_T szParamSize = sDllPath.size();
 		DWORD dwThreadResult = 0;
 
-		Invoke(lpProcAddr, lpProcParam, szParamSize, [&](HANDLE hThread){
-			if (hThread != nullptr) {
-				// Wait for end LoadLibrary call
-				if (WaitForSingleObject(hThread, INFINITE) == WAIT_FAILED) {
-					return;
-				}
-
-				GetExitCodeThread(hThread, &dwThreadResult);
-				m_hRemoteModule = (HMODULE)dwThreadResult;
-				// Get m_hRemoteModule
+		Invoke(lpProcAddr, lpProcParam, szParamSize, [&](const HANDLE &hThread){
+			// Wait for end LoadLibrary call
+			if (WaitForSingleObject(hThread, INFINITE) == WAIT_FAILED) {
+				throw std::runtime_error("target process does not respond");
 			}
+
+			GetExitCodeThread(hThread, &dwThreadResult);
+			if (dwThreadResult == 0) {
+				throw std::runtime_error("DLL not loaded in target process");
+			}
+
+			// FIXME: not correct convert
+			m_hRemoteModule = nullptr; // (HMODULE)dwThreadResult;
 		});
 	}
 
@@ -77,7 +125,6 @@ namespace Inject
 		return new Injector(dwProcId, sDllPath);
 	}
 
-	//Function written by batfitch
 	DWORD Injector::GetProcessId(const std::wstring& sExePath)
 	{
 		HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -88,6 +135,7 @@ namespace Inject
 			BOOL bRet = Process32First(hSnapshot, &pe);
 
 			do {
+				// return first matched process id (TODO: parent?)
 				if (!_wcsicmp(pe.szExeFile, sExePath.c_str())) {
 					return pe.th32ProcessID;
 				}
@@ -99,29 +147,42 @@ namespace Inject
 		return (DWORD)0;
 	}
 
-	/*
-	 * @param HANDLE process
-	 * @param LPVOID procAddress
-	 * @param LPVOID parameter
-	 * @return HMODULE
-	 */
-	void Injector::Invoke(LPVOID lpProcAddr, LPVOID lpProcParam, SIZE_T szParamSize, std::function<void(HANDLE)> fpResponseHandle)
+	void Injector::Invoke(LPVOID lpProcAddr, LPVOID lpProcParam, SIZE_T szParamSize, std::function<void(const HANDLE&)> fpResponseHandle)
 	{
 		LPVOID lpMemory = nullptr; // Declare the memory we will be allocating
-		HANDLE hThread = nullptr;
+		HANDLE hThread = nullptr; 
 		BOOL bCode = FALSE;
 
 		// Allocate space in the process for our DLL 
 		lpMemory = (LPVOID)VirtualAllocEx(m_hProcess, NULL, szParamSize + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		if (lpMemory == nullptr) {
+			throw std::runtime_error("VirtualAllocEx failed");
+		}
 
 		// Write the string name of our DLL in the memory allocated 
 		bCode = WriteProcessMemory(m_hProcess, (LPVOID)lpMemory, lpProcParam, szParamSize + 1, NULL);
+		if (bCode == FALSE) {
+			VirtualFreeEx(m_hProcess, (LPVOID)lpMemory, 0, MEM_RELEASE);
+			throw std::runtime_error("WriteProcessMemory failed");
+		}
 
 		// Load our DLL 
 		hThread = CreateRemoteThread(m_hProcess, NULL, NULL, (LPTHREAD_START_ROUTINE)lpProcAddr, (LPVOID)lpMemory, NULL, NULL);
+		if (hThread == nullptr) {
+			VirtualFreeEx(m_hProcess, (LPVOID)lpMemory, 0, MEM_RELEASE);
+			throw std::runtime_error("CreateRemoteThread failed");
+		}
 
 		// do custom handle
-		fpResponseHandle(hThread);
+		if (fpResponseHandle != nullptr) {
+			try {
+				fpResponseHandle(hThread);
+			}
+			catch (const std::runtime_error &ex) {
+				VirtualFreeEx(m_hProcess, (LPVOID)lpMemory, 0, MEM_RELEASE);
+				throw;
+			}
+		}
 
 		//Lets free the memory we are not using anymore.
 		VirtualFreeEx(m_hProcess, (LPVOID)lpMemory, 0, MEM_RELEASE);

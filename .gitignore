@@ -21,6 +21,7 @@ build/
 bld/
 [Bb]in/
 [Oo]bj/
+*.vcxproj.filters
 
 # Roslyn cache directories
 *.ide/
